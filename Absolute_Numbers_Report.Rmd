@@ -1,0 +1,711 @@
+---
+title: "Calculating Absolute Visit Counts in SafeGraph Data"
+author: "Nick Huntington-Klein"
+date: "Updated `r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, cache = FALSE)
+library(SafeGraphR)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(lubridate)
+library(readxl)
+library(stringr)
+library(purrr)
+library(ggpubr)
+library(scales)
+library(extrafont)
+library(knitr)
+library(kableExtra)
+library(jtools)
+
+# Load in NFL data and prep
+nfl <- read_excel('football_games.xlsx') %>%
+  as.data.table()
+
+nfl <- nfl[!(is.na(location_name))]
+nfl[, Total := NULL]
+nfl[, Home := NULL]
+nfl[, Away := NULL]
+nfl[, Tm := NULL]
+
+setnames(nfl, 'Week 17 Data','Week 17 Date')
+
+nms <- names(nfl)
+nms <- nms[nms != 'location_name']
+
+dts <- nms[str_sub(nms,-4) == 'Date']
+cts <- nms[!(nms %in% dts)]
+
+nfl <- melt(nfl, id.vars = c('location_name'), measure.vars = list(dts,cts))  
+nfl <- nfl[!is.na(value2)]
+
+setnames(nfl, c('value1','value2'), c('date','count'))
+
+nfl[,variable := NULL]
+nfl[,date := as.Date(date)]
+
+nfldata <- list.files(pattern = 'stadium') %>%
+  map(readRDS) %>%
+  rbindlist(fill = TRUE)
+
+nfldata <- nfldata[!is.na(visits_by_day)]
+
+nfl <- merge(nfl, nfldata, by = c('location_name','date'), all = TRUE)
+nfl[,safegraph_place_id := NULL]
+nfl[,day := NULL]
+
+# Starbucks data
+sbux <- list.files(pattern='sbux') %>%
+  map(readRDS) %>%
+  rbindlist()
+
+# Normalization
+norm <- readRDS('normalization_data_for_absolute.Rdata')
+
+```
+
+## Absolute Values
+
+One difficult thing about SafeGraph data is that while it's very easy to use it to calculate *relative changes* in foot traffic to an area or POI, it's not clear how we can use it to calculate *absolute values* of visits, since (1) we only have a subsample of the population, (2) we count devices and visits, not people, and people can own multiple devices and make multiple visits, and (3) we don't know if the people who select into the sample are more/less likely to visit places (or certain places!). Among other things.
+
+The first-stab pass at fixing this problem has been to just scale a measure of the overall sample up to the size of the population, for example multiplying any given visit number by $Population/SGSample$, where $SGSample$ is measured at the national/state/county/CBG/what have you level, and could be a count of the total number of visits (by aggregating across patterns or using `normalization-data`), the total number of devices in sample (in `normalization-data`) or the number of devices residing in an area (`home-panel-summary`) being the most commonly-recommended adjustment measures, among a few other measures.
+
+There has already been [some success](https://github.com/GeoDS/COVID19USFlows/tree/master/daily_flows) applying this kind of scaling to translate mobility SafeGraph visitor flows into population-count mobility flows in a way that at least correlates well with other models of mobility flows.
+
+In this document I will take some real-world locations for which we have a decent idea of what the actual visitor count is from other data, and see how well different scaling methods work to make the SafeGraph counts match the other-source counts.
+
+I won't be displaying the code I used in this doc, but you can look at all the files in the [GitHub repo](https://github.com/NickCH-K/SafeGraphAbsoluteNumbers).
+
+### Starbucks
+
+The first set of real-world locations I'll check is Starbucks, specifically all Starbucks locations from September-December 2019 (why this period? Because I was already getting NFL data, see the next section). 
+
+I have found evidence from a few places, for example [here](https://www.nasdaq.com/articles/closer-look-starbucks-growth-2017-04-10) that in 2019 the number of daily *customers* to a Starbucks was in the range of 460-500 per day. Averaging across all Starbucks locations, we can see what adjustment we need to do to get around there.
+
+Pros of the Starbucks analysis:
+
+* We got lotsa Starbucks to average over, so noise shouldn't be a huge factor
+* I tried looking for daily customer/visitor counts at a lot of different chain restaurants and this information seemed to be pretty tight under wraps, but I found Starbucks numbers in a few places that all looked similar
+* Because our target number is a grand average, we can test out adjustments at the national level
+
+Cons of the Starbucks analysis:
+
+* The target number of 460-500 is a loose number for a few reasons: first, it's not just from the USA. Second, it counts customers, not visitors, which would include staff and people who don't buy anything, and will undercount if people come in large groups but only one person pays
+* So really, our goal is figuring out what $SafeGraphAdjustment$ should be when the equation is $GoalNumber = (460 to 500) \times SafeGraphAdjustment \times AdjustFromCustomersToVisitors$, and we basically have to guess what $AdjustFromCustomersToVisitors$ is. But still we will have a loose goal.
+* I'm just using September-December data so I didn't have to bother the SafeGraph AWs server with downloading all of 2019. It's possible that this is an especially high/low time for Starbucks. So chuck that in as an adjustment factor too. In any case we're looking for a ballpark here, not a precise match.
+
+### National Football League
+
+The second set of real-world locations I'm using is based on the 2019 NFL schedule. We have attendance counts for each game in the season from [Pro-Football-Reference](https://www.pro-football-reference.com/years/2019/attendance.htm), as well as the date and location each game was played. We can compare the attendance figures to the SafeGraph visits to the relevant stadiums.
+
+Pros of the NFL analysis:
+
+* Those attendance numbers are probably fairly accurate. I don't think they count staff or players, but that's likely to be a pretty small number relative to attendance.
+* We have a lot of the stadiums in the POI list. Only exceptions are for the Baltimore Ravens, Buffalo Bills, and Oakland/Las Vegas Raiders. There are a few more in the POI list but without any apparent visit data. Plus, the number of stadiums is small enough that I could check each by hand to be sure we had the right POI(s).
+* With only a few exceptions, stadiums are represented as a single POI, reducing double-counting issues
+* We have a lot of events to compare
+
+Cons of the NFL analysis:
+
+* These are single-day events, so noise is likely to be a bigger factor, and we can't do things like seven-day moving averages
+* These are local events, so we'll want to use localized adjustments, but they also draw in people from outside the area, which makes local-population adjustmnents iffy
+* Because this is 2019 data, I can't use the state-by-state numbers in the newer `normalization-data`. So we won't be able to check that.
+* In doing data entry for this I learned there's a team called the "Houston Texans." C'mon, have a little imagination.
+
+
+# Analysis
+
+## Starbucks
+
+Let's start by taking the average raw visits to Starbucks locations in the data. I'll drop any location/day with zero visitors, as that's likely a day the location is closed. The average here will give us a sense of what our multiplier *should be*, at least on average. Remember that our goal is something like 460-500, then adjusted upwards for staff and non-customer visitors.
+
+```{r}
+sbux_flat <- sbux[visits_by_day != 0]
+
+sbux_flat <- sbux_flat[,.(visits_by_day = mean(visits_by_day)), by = 'date']
+
+ggplot(sbux_flat, aes(x = date, y = visits_by_day)) + 
+  geom_line(size = 1, color = 'blue') + 
+  geom_hline(aes(yintercept = mean(visits_by_day)), linetype = 'dashed', color = 'black')+
+  annotate(y = mean(sbux_flat$visits_by_day), x = max(sbux_flat$date)+18, hjust = .5, vjust = .5,
+           geom = 'text', label = paste0('Grand Mean\n',number(mean(sbux_flat$visits_by_day), accuracy = .1)),
+           size = 14/.pt, family = 'Georgia')+
+  theme_pubr() + 
+  expand_limits(x = max(sbux_flat$date)+28) +
+  theme(text = element_text(size = 16,
+                            family = 'Georgia')) +
+  labs(x = 'Date',
+       y = 'SafeGraph Raw Count (Mean)')
+
+sbux_flat <- sbux_flat[order(visits_by_day)][-(1:2)]
+```
+
+Visits are relatively flat, with some within-week variation, which is a relief-if there were some big trend here we'd probably be worried about only using a quarter of the year rather than the whole thing.
+
+We get big dips at what looks like Thanksgiving and Christmas, so a target of 460-500 doesn't seem appropriate for those days. After dropping them we get a new grand mean of `r number(mean(sbux_flat$visits_by_day), accuracy = .1)`, meaning that we are looking to scale up by at least `r number(460/mean(sbux_flat$visits_by_day), accuracy = .1)` to even hit 460.
+
+So how can we scale?
+
+### Starbucks with Normalization Data
+
+First, let's try just using the national normalization data and see what we can get. Our options in the file are `total_visits`, `total_devices_seen`, `total_home_visits`, and `total_home_visitors`, all of which vary daily. For each of these, we'll take the rounded 2019 US population estimate of 329 million (from [here](https://www.census.gov/newsroom/press-kits/2019/national-state-estimates.html)) and divide it by the SafeGraph number to get our adjustment factor, and then multiply that adjustment factor by our raw SafeGraph count. The horizontal line represents the *minimal* target of 460.
+
+```{r}
+sbuxstack <- names(norm)[1:4] %>%
+  map(function(x) {
+    dt <- merge(sbux_flat, norm[,c('date',x), with = FALSE], by = 'date')
+    setnames(dt, x, 'adj')
+    dt[,adjusted := visits_by_day*329000000/adj]
+    dt[,factor := x]
+    return(dt)
+  }) %>%
+  rbindlist()
+
+ggplot(sbuxstack, aes(x = date, y = adjusted)) + 
+  geom_line(size = 1, color = 'blue') + 
+  geom_hline(aes(yintercept = 460), linetype = 'dashed', color = 'black')+
+  theme_pubr() + 
+  expand_limits(x = max(sbux_flat$date)+28) +
+  theme(text = element_text(size = 16,
+                            family = 'Georgia')) +
+  labs(x = 'Date',
+       y = 'SafeGraph Raw Count (Mean)') +
+  facet_wrap(~factor, scales = 'free', nrow = 2)
+
+sbuxtable <- sbuxstack[,.(`Grand Mean` = number(mean(adjusted), accuracy = .1)), by = 'factor']  
+setnames(sbuxtable, 'factor', 'Adjustment Factor')
+
+kable(sbuxtable, caption = 'Average Daily Visitors per Starbucks Location After Adjustment') %>%
+  kable_styling('striped')
+```
+
+This looks pretty good! The preferred adjustment factor of `total_devices_seen` gives us `r sbuxtable[2,2]` which by my intuition is probably a little low, even at the bottom target of 460, once you factor in non-customers. But that's a guess on my part. It's probably not a big undershot. Somewhere between that and `total_home_visitors` is more what I would guess is the actual right number. But that's a guess on my part - this doesn't look too bad.
+
+How about the individual Starbucks locations under this adjustment? Now, surely, each Starbucks actually gets a different amount of traffic - some are busier or bigger than others. But the distribution probably isn't *wildly* wide. How big does it get? This time instead of averaging all locations for each day, I average each of the `r length(unique(sbux$safegraph_place_id))` locations across all days and plot the distribution.
+
+```{r}
+sbuxstack <- names(norm)[1:4] %>%
+  map(function(x) {
+    dt <- merge(sbux, norm[,c('date',x), with = FALSE], by = 'date')
+    setnames(dt, x, 'adj')
+    dt[,adjusted := visits_by_day*329000000/adj]
+    dt[,factor := x]
+    return(dt)
+  }) %>%
+  rbindlist()
+
+sbux_dist <- sbuxstack[,.(adjusted = mean(adjusted)), by = c('safegraph_place_id', 'factor')]
+rm(sbuxstack)
+
+ggplot(sbux_dist, aes(x = adjusted)) + 
+  geom_density(color = 'blue', size = 1) +
+  geom_vline(aes(xintercept = 460), color = 'black', linetype = 'dashed')+
+  theme_pubr() + 
+  theme(text = element_text(size = 16,
+                            family = 'Georgia'),
+        axis.text.y = element_blank()) +
+  scale_x_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  labs(x = 'Average Adjusted Daily Visits by Store (Thousands)',
+       y = 'Density') +
+  facet_wrap(~factor, scales = 'free', nrow = 2)
+  
+```
+
+Them's some tails! Now, there are some Starbucks locations that are likely *way* busier than others-the roasteries, the spot I'm guessing they have in like Central Station or Disneyland or something. But is it realistic that there are Starbucks' with ~15k visitors a day? Maybe! I've been to the one in Disneyland, it's jammed all day every day. But it seems likely that those very-busy spots, which I'm going to guess are indeed at the top of the pile here, are being overcounted.
+
+Perhaps the summary file normalizations will do better, since they can operate on a more local level?
+
+### Starbucks with panel summary data
+
+```{r, include = FALSE}
+print(sbux[1:10])
+
+sbux[, fips := floor(poi_cbg/10000000)]
+sbux[, state_fips := floor(fips/1000)]
+
+print(sbux[1:10])
+
+sf <- readRDS('summary_file_absolute_values.Rdata')
+
+print(sf[1:10])
+
+cty_pop <- fread('co-est2019-annres.csv', skip = 1, header = TRUE)
+data("fips_to_names")
+fips_to_names[,County := paste0('.',countyname,', ', statename)]
+cty_pop[,County := fifelse(str_sub(County,1,1) == '.',
+                           County,
+                           paste0('.',County))]
+cty_pop <- merge(cty_pop, fips_to_names, all = TRUE, by = 'County')
+cty_pop[,fips := state_fips*1000+county_fips]
+cty_pop <- cty_pop[,c('fips','2019')]
+setnames(cty_pop, '2019', 'pop')
+cty_pop[,pop := as.numeric(str_replace_all(pop, ',',''))]
+
+sf[, fips := floor(census_block_group/10000000)]
+sf <- sf[, .(number_devices_residing = sum(number_devices_residing)), by = c('fips','date_range_start')]
+sf <- merge(sf, cty_pop, by = 'fips')
+
+sf[, date_range_start := as.Date(date_range_start)]
+setnames(sf, 'date_range_start', 'date')
+
+print(sf[1:10])
+
+# Bring 'em together
+sbux <- copy(sf)[sbux, roll = TRUE, on = c('fips','date')]
+setnames(sbux, c('number_devices_residing','pop'), c('ndr_county', 'pop_county'))
+
+sf[,state_fips := floor(fips/1000)]
+sf <- sf[, .(number_devices_residing = sum(number_devices_residing),
+                   pop = sum(pop)), by = c('state_fips','date')]
+sbux[, state_fips := floor(fips/1000)]
+sbux <- copy(sf)[sbux, roll = TRUE, on = c('state_fips','date')]
+setnames(sbux, c('number_devices_residing','pop'), c('ndr_state', 'pop_state'))
+
+sf <- sf[, .(number_devices_residing = sum(number_devices_residing),
+                 pop = sum(pop)), by = c('date')]
+sbux <- copy(sf)[sbux, roll = TRUE, on = 'date']
+setnames(sbux, c('number_devices_residing','pop'), c('ndr_nat', 'pop_nat'))
+
+print(sbux[1:10])
+
+
+data("cbg_pop")
+setnames(cbg_pop,'unweighted_pop','pop')
+sf <- readRDS('summary_file_absolute_values.Rdata')
+
+setnames(sf, 'census_block_group','poi_cbg')
+sf[,poi_cbg := as.character(poi_cbg)]
+sf <- merge(sf, cbg_pop, by = 'poi_cbg')
+setnames(sf, c('number_devices_residing','pop'), c('ndr_cbg','pop_cbg'))
+sf[, date_range_start := as.Date(date_range_start)]
+setnames(sf, 'date_range_start', 'date')
+
+sbux[, poi_cbg := as.character(poi_cbg)]
+sbux <- copy(sf)[sbux, roll = TRUE, on = c('poi_cbg','date')]
+
+print(sbux[1:10])
+
+sbux[, adjusted_cbg := visits_by_day*pop_cbg/ndr_cbg]
+sbux[, adjusted_county := visits_by_day*pop_county/ndr_county]
+sbux[, adjusted_state := visits_by_day*pop_state/ndr_state]
+sbux[, adjusted_nat := visits_by_day*pop_nat/ndr_nat]
+
+print(sbux[1:10])
+
+```
+
+Now let's take the panel summary data and try to use `number_devices_residing`, along with information about CBG and county population, to fix things up! We'll also try at the state and national level.
+
+```{r}
+
+sbflat <- sbux[, .(adjusted = mean(adjusted_cbg, na.rm = TRUE)), by = 'date']
+ggplot(sbflat, aes(x = date, y = adjusted)) + 
+   geom_line(size = 1, color = 'blue') + 
+  geom_hline(aes(yintercept = mean(adjusted, na.rm = TRUE)), linetype = 'dashed', color = 'black')+
+  annotate(y = mean(sbflat$adjusted, na.rm = TRUE), 
+           x = max(sbux$date)+18, hjust = .5, vjust = .5,
+           geom = 'text', label = paste0('Grand Mean\n',
+                                         number(mean(sbflat$adjusted, na.rm = TRUE), accuracy = .1)),
+           size = 14/.pt, family = 'Georgia')+
+ theme_pubr() + 
+   expand_limits(x = max(sbux_flat$date)+28) +
+   theme(text = element_text(size = 16,
+                             family = 'Georgia')) +
+   labs(x = 'Date',
+        y = 'SafeGraph Raw Count (Mean)',
+        title = 'CBG Adjustment')
+```
+
+```{r}
+sbflat <- sbux[, .(adjusted = mean(adjusted_county, na.rm = TRUE)), by = 'date']
+ggplot(sbflat, aes(x = date, y = adjusted)) + 
+   geom_line(size = 1, color = 'blue') + 
+  geom_hline(aes(yintercept = mean(adjusted, na.rm = TRUE)), linetype = 'dashed', color = 'black')+
+  annotate(y = mean(sbflat$adjusted, na.rm = TRUE), 
+           x = max(sbux$date)+18, hjust = .5, vjust = .5,
+           geom = 'text', label = paste0('Grand Mean\n',
+                                         number(mean(sbflat$adjusted, na.rm = TRUE), accuracy = .1)),
+           size = 14/.pt, family = 'Georgia')+
+ theme_pubr() + 
+   expand_limits(x = max(sbux_flat$date)+28) +
+   theme(text = element_text(size = 16,
+                             family = 'Georgia')) +
+   labs(x = 'Date',
+        y = 'SafeGraph Raw Count (Mean)',
+        title = 'County Adjustment')
+```
+
+```{r}
+sbflat <- sbux[, .(adjusted = mean(adjusted_state, na.rm = TRUE)), by = 'date']
+ggplot(sbflat, aes(x = date, y = adjusted)) + 
+   geom_line(size = 1, color = 'blue') + 
+  geom_hline(aes(yintercept = mean(adjusted, na.rm = TRUE)), linetype = 'dashed', color = 'black')+
+  annotate(y = mean(sbflat$adjusted, na.rm = TRUE), 
+           x = max(sbux$date)+18, hjust = .5, vjust = .5,
+           geom = 'text', label = paste0('Grand Mean\n',
+                                         number(mean(sbflat$adjusted, na.rm = TRUE), accuracy = .1)),
+           size = 14/.pt, family = 'Georgia')+
+ theme_pubr() + 
+   expand_limits(x = max(sbux_flat$date)+28) +
+   theme(text = element_text(size = 16,
+                             family = 'Georgia')) +
+   labs(x = 'Date',
+        y = 'SafeGraph Raw Count (Mean)',
+        title = 'State Adjustment')
+```
+
+```{r}
+sbflat <- sbux[, .(adjusted = mean(adjusted_nat, na.rm = TRUE)), by = 'date']
+ggplot(sbflat, aes(x = date, y = adjusted)) + 
+   geom_line(size = 1, color = 'blue') + 
+  geom_hline(aes(yintercept = mean(adjusted, na.rm = TRUE)), linetype = 'dashed', color = 'black')+
+  annotate(y = mean(sbflat$adjusted, na.rm = TRUE), 
+           x = max(sbux$date)+18, hjust = .5, vjust = .5,
+           geom = 'text', label = paste0('Grand Mean\n',
+                                         number(mean(sbflat$adjusted, na.rm = TRUE), accuracy = .1)),
+           size = 14/.pt, family = 'Georgia')+
+ theme_pubr() + 
+   expand_limits(x = max(sbux_flat$date)+28) +
+   theme(text = element_text(size = 16,
+                             family = 'Georgia')) +
+   labs(x = 'Date',
+        y = 'SafeGraph Raw Count (Mean)',
+        title = 'National Adjustment')
+
+```
+
+In all of these, the CBG adjustment doesn't appear to work very well, even though a particular Starbucks is likely a local thing in many cases. The other three levels of aggregation all work just about the same. Interestingly, this implies a similar (although certainly not identical) portion of the population being sampled in different areas. But in any case, this adjustment is not quite as successful as you get with the normalization file. It doesn't adjust upwards as much, which is what we need.
+
+## National Football League
+
+As just a quick check before we try adjusting stuff, let's make sure we're properly aligning the data. Could we figure out which days were game days without having the schedule?
+
+```{r}
+ggplot(nfl, aes(x = date, y = visits_by_day, color = is.na(count))) + 
+  geom_point() + 
+  theme_pubr() + 
+  guides(color = FALSE) + 
+  scale_y_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) + 
+  labs(x = 'Date', y = 'SafeGraph Visits (Thousands)') + 
+  scale_color_manual(values = c('blue','gray')) + 
+  annotate(geom = 'text', x = ymd('2019-10-01'), y = 10000, 
+           label = 'NFL Game Days', color = 'blue', size = 16/.pt, family = 'Georgia') + 
+  theme(text = element_text(size = 16,
+                            family = 'Georgia'))
+```
+
+It looks like it works pretty well. While there are certainly active days at these stadiums that *aren't* game days (and are likely other events), we see that game days in general are much higher than your average day, as you'd expect. How about those few little blue dots nestled down at the bottom? What are those?
+
+```{r}
+badsub <- nfl[visits_by_day < 500 & !is.na(count)]
+badsub[,poi_cbg := NULL]
+setnames(badsub, names(badsub), c('Stadium Name', 'Date','Official Count','SafeGraph Count'))
+
+kable(badsub,caption = 'Suspiciously Low SafeGraph Counts') %>%
+  kable_styling('striped')
+
+nfl <- nfl[!(location_name %in% unique(badsub[['Stadium Name']]))]
+nfl <- nfl[!(is.na(count))]
+nfl <- nfl[!(is.na(visits_by_day))]
+```
+
+Well that ain't right. Checking the raw data, it's not that the dates of the games are wrong either, we just have very few SG visits to those POIs. We also notice the rather odd phenomenon that FirstEnergy Stadium appears to have the exact same attendance for every game, which is in the data I downloaded. Probably best to get rid of that one anyway. Let's get rid of these two stadiums going forward.
+
+With that out of the way, we have `r nrow(nfl)` games to look at. Let's start by seeing what adjustment factors we'd *want* to have, i.e. by just comparing the raw counts, under the simplifying assumption that there are no staff at the games.
+
+```{r}
+ggplot(nfl, aes(x = visits_by_day, y = count)) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) +
+  geom_smooth(se = FALSE) +
+  theme_pubr() + 
+  theme(text = element_text(size = 16,
+                            family = 'Georgia')) +
+  scale_x_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  scale_y_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  labs(x = 'SafeGraph Raw Count (Thousands)',
+       y = 'Raw Attendance (Thousands)',
+       caption = 'Straight line is OLS fit. Curved line is LOESS.')
+```
+
+
+We see a that a straight line seems to fit the data okay, nearly matching the nonparametric LOESS fit, which is a relief, as it suggests that the adjustment needs to be fairly straightforward. We also see that the fit is weaker for smaller events, which is a potential concern given that most things we'd want to estimate the number of absolute visits for are much smaller than NFL games. This is also exactly what we'd expect, though-smaller events, more noise. So no big surprise there. In general we should keep in mind that any absolute-count for a smaller event/location is likely to be noisier.
+
+Ideally, the intercept on that OLS fit is 0, allowing us to just multiply by a number. Is it? Let's also see what we get with a polynomial fit, and a logarithmic fit since it sorta looks like we have a curve in the graph but it's not clear whether it's that or just the heteroskedasticity.
+
+```{r}
+export_summs(lm(count~visits_by_day, data = nfl),
+             lm(count~visits_by_day + I(visits_by_day^2), data = nfl),
+             lm(count~log(visits_by_day), data = nfl),
+             model.names = 'Attendance Counts',
+             coefs = c(`SafeGraph Visits` = 'visits_by_day',
+                       `SG Visits Squared` = 'I(visits_by_day^2)',
+                       `SG Visits Logged` = 'log(visits_by_day)',
+                       Intercept = '(Intercept)'))
+```
+
+
+All of these columns have a clearly nonzero intercept, which is a problem. We can make a decent guess at a multiplicative factor by looking at population ratios, but if we didn't know what that intercept was we'd have no real way of guessing it.
+
+Regardless, let's forge ahead and see what we can do.
+
+### NFL with normalization data
+
+First, let's try just using the national normalization data and see what we can get. Our options in the file are `total_visits`, `total_devices_seen`, `total_home_visits`, and `total_home_visitors`, all of which vary daily. For each of these, we'll take the rounded 2019 US population estimate of 329 million (from [here](https://www.census.gov/newsroom/press-kits/2019/national-state-estimates.html)) and divide it by the SafeGraph number to get our adjustment factor, and then multiply that adjustment factor by our raw SafeGraph count. Straight lines indicate the point where the adjusted values exactly match the attendance records.
+
+```{r}
+nflstack <- names(norm)[1:4] %>%
+  map(function(x) {
+    dt <- merge(nfl, norm[,c('date',x), with = FALSE], by = 'date')
+    setnames(dt, x, 'adj')
+    dt[,adjusted := visits_by_day*329000000/adj]
+    dt[,factor := x]
+    return(dt)
+  }) %>%
+  rbindlist()
+
+ggplot(nflstack, aes(x = adjusted, y = count)) + 
+  geom_point() + 
+  geom_function(fun = function(x) x) + 
+  theme_pubr()  + 
+  theme(text = element_text(size = 16,
+                            family = 'Georgia')) +
+  scale_x_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  scale_y_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  labs(x = 'Adjusted SafeGraph Count (Thousands)',
+       y = 'Raw Attendance Count (Thousands)') + 
+  facet_wrap(~factor, scales = 'free', nrow = 2)
+  
+```
+
+All of these except `total_visits` do an okay job for smaller values but wildly understate large ones. `total_visits` has a decent slope to it but is undercounting in general, which makes sense since we're dividing by visits, which people do many of, and multiplying by people, which there's only one of per person. In general we just have way too much variation in the SafeGraph visits relative to the attendance numbers.
+
+I tried doing some [Empirical Bayes shrinkage](https://kiwidamien.github.io/shrinkage-and-empirical-bayes-to-improve-inference.html) to pull in some of those large values but it didn't really do anything, and also to do this you have to have a group to shrink towards. Here there are multiple events across stadiums and dates to shrink to, but that won't work in every application anyway.
+
+What if I just try a bunch of random adjustments until I find one that looks nice? I get this:
+
+```{r}
+nflstack <- names(norm)[1:4] %>%
+  map(function(x) {
+    dt <- merge(nfl, norm[,c('date',x), with = FALSE], by = 'date')
+    setnames(dt, x, 'adj')
+    dt[,adjusted := (visits_by_day*329000000/adj)]
+    dt[,factor := x]
+    return(dt)
+  }) %>%
+  rbindlist()
+
+ggplot(nflstack, aes(x = mean(adjusted)+(adjusted - mean(adjusted))/(sqrt(17)),
+                     y = count)) + 
+  geom_point() + 
+  geom_function(fun = function(x) x) + 
+  theme_pubr()  + 
+  theme(text = element_text(size = 16,
+                            family = 'Georgia')) +
+  scale_x_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  scale_y_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  labs(x = 'Adjusted SafeGraph Count (Thousands)',
+       y = 'Raw Attendance Count (Thousands)') + 
+  facet_wrap(~factor, scales = 'free', nrow = 2)
+  
+```
+
+This seems to work okayish... `total_home_visits` looks good but there's no real reason we'd expect to want to use that scaling into *population*. `total_devices_seen`, generally considered the preferred measure anyway, actually looks pretty nice if you factor in the potential for staff being counted. but what is it? Basically what I did is I transformed each SafeGraph observation by shrinking it very crudely towards the mean, which surprisingly "works" better than Empirical Bayes here.
+
+If $\bar{\mu}$ is the overall sample mean after adjusting for population and $X_i$ is an individual observation after adjusting for population, the transformation is:
+
+$$ Transformed = \hat{\mu} + (X_i-\hat{\mu})/\sqrt{17} $$
+
+Where $17$ is the number of weeks in the NFL season. How we might apply this to, say, an individual event is less clear. And the equation is mostly arbitrary - you might see a similar transformation elsewhere but there's no real justification for using it here other than that I thought it might work and it did. 17 is even pretty arbitrary - we're analyzing things at the set of all games. Why 17 and not the total number of games? 17 works, and `r nrow(nfl)` doesn't, though. If we're being honest, I'm just smushing a bunch of the variance out here, rather than following any particularly principled shrinkage method. But principled shrinkage is shrinking too little!
+
+What we *can* get out of this is that SafeGraph counts for events have considerably more variation than actual counts, and so you want *some form* of shrinkage if you have multiple events/target estiamtes, and if you've only got one absolute value you're trying to estimate, you will probably want to pair it with other estimates of  something similar you can use to balance out the variation.
+
+Thinking about it through another lens though, maybe "Shrinkage" isn't the right way to think about it. This transformation actually makes the small events worse - they were already fine! The value of this is in bringing down the values of the huge events. There's more of a "big-event" problem than a "too much variation" problem in the NFL games.
+
+### NFL with panel summary data
+
+```{r, include = FALSE}
+# data.tables like to be recognized with print commands before you can really use them???
+print(nfl[1:10])
+
+nfl[, fips := floor(poi_cbg/10000000)]
+nfl[, state_fips := floor(fips/1000)]
+
+print(nfl[1:10])
+
+sf <- readRDS('summary_file_absolute_values.Rdata')
+
+print(sf[1:10])
+
+cty_pop <- fread('co-est2019-annres.csv', skip = 1, header = TRUE)
+data("fips_to_names")
+fips_to_names[,County := paste0('.',countyname,', ', statename)]
+cty_pop[,County := fifelse(str_sub(County,1,1) == '.',
+                           County,
+                           paste0('.',County))]
+cty_pop <- merge(cty_pop, fips_to_names, all = TRUE, by = 'County')
+cty_pop[,fips := state_fips*1000+county_fips]
+cty_pop <- cty_pop[,c('fips','2019')]
+setnames(cty_pop, '2019', 'pop')
+cty_pop[,pop := as.numeric(str_replace_all(pop, ',',''))]
+
+sf[, fips := floor(census_block_group/10000000)]
+sf <- sf[, .(number_devices_residing = sum(number_devices_residing)), by = c('fips','date_range_start')]
+sf <- merge(sf, cty_pop, by = 'fips')
+
+sf[, date_range_start := as.Date(date_range_start)]
+setnames(sf, 'date_range_start', 'date')
+
+print(sf[1:10])
+
+# Bring 'em together
+nfl <- copy(sf)[nfl, roll = TRUE, on = c('fips','date')]
+setnames(nfl, c('number_devices_residing','pop'), c('ndr_county', 'pop_county'))
+
+sf[,state_fips := floor(fips/1000)]
+sf <- sf[, .(number_devices_residing = sum(number_devices_residing),
+                   pop = sum(pop)), by = c('state_fips','date')]
+nfl[, state_fips := floor(fips/1000)]
+nfl <- copy(sf)[nfl, roll = TRUE, on = c('state_fips','date')]
+setnames(nfl, c('number_devices_residing','pop'), c('ndr_state', 'pop_state'))
+
+sf <- sf[, .(number_devices_residing = sum(number_devices_residing),
+                 pop = sum(pop)), by = c('date')]
+nfl <- copy(sf)[nfl, roll = TRUE, on = 'date']
+setnames(nfl, c('number_devices_residing','pop'), c('ndr_nat', 'pop_nat'))
+
+print(nfl[1:10])
+```
+
+Now let's take the panel summary data and try to use `number_devices_residing`, along with information about county population, to fix things up! We'll also try at the state and national level.
+
+```{r}
+ggplot(nfl, aes(x = visits_by_day*pop_county/ndr_county,
+                     y = count)) + 
+  geom_point() + 
+  geom_function(fun = function(x) x) + 
+  theme_pubr()  + 
+  theme(text = element_text(size = 16,
+                            family = 'Georgia')) +
+  scale_x_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  scale_y_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  labs(x = 'Adjusted SafeGraph Count (Thousands)',
+       y = 'Raw Attendance Count (Thousands)',
+       title = 'County-Level Population Adjustment')
+
+ggplot(nfl, aes(x = visits_by_day*pop_state/ndr_state,
+                     y = count)) + 
+  geom_point() + 
+  geom_function(fun = function(x) x) + 
+  theme_pubr()  + 
+  theme(text = element_text(size = 16,
+                            family = 'Georgia')) +
+  scale_x_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  scale_y_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  labs(x = 'Adjusted SafeGraph Count (Thousands)',
+       y = 'Raw Attendance Count (Thousands)',
+       title = 'State-Level Population Adjustment')
+
+ggplot(nfl, aes(x = visits_by_day*pop_nat/ndr_nat,
+                     y = count)) + 
+  geom_point() + 
+  geom_function(fun = function(x) x) + 
+  theme_pubr()  + 
+  theme(text = element_text(size = 16,
+                            family = 'Georgia')) +
+  scale_x_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  scale_y_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  labs(x = 'Adjusted SafeGraph Count (Thousands)',
+       y = 'Raw Attendance Count (Thousands)',
+       title = 'National Population Adjustment')
+```
+
+This appears to give us almost exactly the same problem as with the `normalization-data` adjustments. Does the same weird fix work?
+
+```{r}
+nfl[,adjusted := visits_by_day*pop_county/ndr_county]
+
+ggplot(nfl, aes(x = mean(adjusted)+(adjusted - mean(adjusted))/(sqrt(17)),
+                     y = count)) + 
+  geom_point() + 
+  geom_function(fun = function(x) x) + 
+  theme_pubr()  + 
+  theme(text = element_text(size = 16,
+                            family = 'Georgia')) +
+  scale_x_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  scale_y_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  labs(x = 'Adjusted SafeGraph Count (Thousands)',
+       y = 'Raw Attendance Count (Thousands)',
+       title = 'County-Level Pop. Adjustment with Shrinkage')
+```
+
+This works about the same. Arguably maybe better than `total_devices_seen`. Still an overstatement of amounts, and relies on that fairly arbitrary 17 and the ability to shrink across a group of events.
+
+# Conclusion
+
+So what can we take away from this?
+
+First, any time we do some sort of scaling to adjust a SafeGraph count upwards to try to get an actual count, we have to necessarily introduce some extra assumptions on top of what we're already doing concerning the representativeness of the sample, the proportion of the population that is sampled, and sampling variation. If you can rephrase whatever question you're trying to ask in terms of relative visits, rather than absolute visits ("visits to X grew by Y% from A to B" rather than "there were Z visitors to X on date B"), that's going to be a safer and more reliable conclusion.
+
+But if an absolute count is important, an absolute count is important. I get it.
+
+Second, scaling to absolute numbers *is possible* and we can get some reasonable numbers from it without doing anything fancy. The Starbucks analysis shows that doing a very simple scaling based on $Population/SGSample$, with $SGSample$ measured using `total_devices_seen` or `number_devices_residing`, gives us a pretty reasonable number. Perfect? No, but pretty darn good.
+
+Third, it really *really* matters *what kind of thing* you're trying to get absolute counts for. I was able to hit Starbucks fairly accurately - Starbucks is an everyday thing for which I was trying to match an *average* attendance count, and the number of visitors I was trying to hit was modest. So I was able to average over lots of Starbucks and lots of days at each Starbucks - this really helps smoothe out noise. The fact that the $Population/SGSample$ scaling worked pretty well (no matter how we did it, other than at the CBG level) tells us that the SafeGraph sample is at least roughly representative - we don't have major sample selection bias issues, or else the $Population/SGSample$ ratio would not at all match the $PopulationVisits/SGVisits$ ratio.
+
+On the other hand, the NFL games are one-off events, so even absent any other issues we already know that these are going to be harder to hit. Estimating the attendance a single event is way harder than estimating the average attendance at a bunch of events. That's statistics, baybee.
+
+But beyond that...
+
+Fourth, *scale* seems to matter a lot, and bigger events are more wrong than smaller events. In the Starbucks analysis, while the average was fine, the most popular Starbucks were *way too popular* in the SafeGraph data.
+
+Similarly, the NFL games are all enormous, and the consistent problem here was overestimation. *For the smallest NFL games, standard adjustment worked fine*, just as was the case for the smallest Starbucks. For small NFL games, the absolute errors were still pretty big, but that's just a consequence of sampling variation, can't really get around that.
+
+Large NFL games, like the largest Starbucks, were way overestimated by standard adjustment, with the biggest games (roughly 100k in measured attendance) getting adjusted SafeGraph estimates in the 200k-250k range. Unrealistic!
+
+There are a few ways we could interpret this.
+
+One is the problem implied by the linear regression table above. Perhaps the relationship *is* linear, but our inability to deal with the intercept when using standard scaling means that we're relying on a scaling function that passes through $(0, 0)$, which perhaps it shouldn't. This would imply a fix related to guessing some sort of intercept for big events - perhaps we get lucky and the intercept turns out to be similar for lots of big events and we can have a rule of thumb.
+
+Another approach is to say that, contrary to what the unscaled NFL scatterplot implied, there's a nonlinear relationship between attendance at an event and SafeGraph visit counts. As an event gets bigger, SafeGraph picks up a *bigger* portion of its attendees. I'm implying something like $SGVisits=\alpha_0 ActualVisits + \alpha_1 ActualVisits^2$ where both $\alpha_0$ and $\alpha_1$ are positive. 
+
+A third approach is to say that the relationship between SafeGraph visits and actual attendance *is* linear, but that the *population adjustment* is the thing that's wrong. i.e. because of how big the events/attractions are, we should be considering a different share of the SafeGraph sample to be the relevant part of it that we should use in the denominator.
+
+Either of these last two could be accounted for by taking the adjustment factor $Population/SGSample$ and running it through some function $f()$ before you use it, where $f()$ is some declining function of $SGVisits$, but designed so that it doesn't affect small events that much. This would have to be estimated over a wide range of data to get it right, though. Just to take one quick guess at it, let's see if making the adjustment factor for game $j$ be $Adj_j = Population/(SGSample\times \log(2+SGVisits-\min(SGVisits)))$ works for NFL games with the panel summary file county sample estimation - I'm not too hopeful:
+
+```{r}
+nfl[,adjusted := visits_by_day*(pop_county/(ndr_county*log(2+visits_by_day-min(visits_by_day))))]
+
+ggplot(nfl, aes(x = adjusted,
+                     y = count)) + 
+  geom_point() + 
+  geom_function(fun = function(x) x) + 
+  theme_pubr()  + 
+  theme(text = element_text(size = 16,
+                            family = 'Georgia')) +
+  scale_x_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  scale_y_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  labs(x = 'Adjusted SafeGraph Count (Thousands)',
+       y = 'Raw Attendance Count (Thousands)',
+       title = 'County-Level Pop. Adjustment with Shrinkage')
+```
+
+That actually doesn't look too bad - the positioning of the cluster of points is way off but the shape is good (I suspect that big point out there on the right is actually the smallest game, which is an easy fix). Clearly an overcorrection, the function needs to have less sharp of a decline, but it's a start. I'm not going to bother pinning down something perfect because it would just apply to NFL games anyway.
+
+### Takeaway
+
+- To estimate an absolute number of visits to an event or location, doing a standard $Population/SGSample$ adjustment, where $SGSample$ is `total_devices_seen` or `number_devices_residing` probably works just fine.
+- Estimates for single events, especially single-day events where we can't do smoothing like NFL games, will be way noisier than estimates for commonly-repeated events, like Starbucks days.
+- It seems likely that the SafeGraph stay-at-home social distancing data is a very Starbucks-like estimation problem. So while I don't have independently measured absolute-number stay-at-home data to compare against, the standard $Population/SGSample$ adjustment probably works fine to estimate the absolute number of people staying at home.
+- The *most well-attended* events (the hottest Starbucks stores, the biggest NFL) games tend to produce vast overestimates using this simple scaling. More work needs to be done on the best way to bring these big events back down to Earth. 
+- Until that last point is figured out, it's probably not a good idea to use SafeGraph to estimate absolute attendance at huge events. Estimating absolute attendance, say, for the number of daily visitors to a store is probably fine.
+
+### Citation
+
+If using this information to justify the use of $Population/SGSample$ scaling in an academic publication, please cite as
+
+Huntington-Klein, Nick. 2020. "Calculating Absolute Visit Counts in SafeGraph Data". Unpublished.
