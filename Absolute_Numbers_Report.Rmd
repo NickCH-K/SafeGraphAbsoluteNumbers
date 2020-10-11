@@ -48,9 +48,14 @@ setnames(nfl, c('value1','value2'), c('date','count'))
 nfl[,variable := NULL]
 nfl[,date := as.Date(date)]
 
-nfldata <- list.files(pattern = 'stadium') %>%
+nfldata <- list.files(path = '../', pattern = '^stadium') %>%
+  paste0('../',.) %>%
   map(readRDS) %>%
   rbindlist(fill = TRUE)
+
+locmap <- nfldata[, .(safegraph_place_id, location_name)] %>%
+  unique()
+locmap <- locmap[!is.na(safegraph_place_id) & !is.na(location_name)]
 
 nfldata <- nfldata[!is.na(visits_by_day)]
 
@@ -59,12 +64,52 @@ nfl[,safegraph_place_id := NULL]
 nfl[,day := NULL]
 
 # Starbucks data
-sbux <- list.files(pattern='sbux') %>%
+sbux <- list.files(path = '../',pattern='^sbux') %>%
+  paste0('../',.) %>%
   map(readRDS) %>%
   rbindlist()
 
 # Normalization
-norm <- readRDS('normalization_data_for_absolute.Rdata')
+norm <- readRDS('../normalization_data_for_absolute.Rdata')
+
+origin_nfldata <- list.files(path = '../',pattern = 'origin-stadium') %>%
+  paste0('../',.) %>%
+  map(readRDS) %>%
+  rbindlist(fill = TRUE) %>%
+  merge(locmap)
+origin_nfldata[, origin_cbg := bit64::as.integer64(origin_cbg)]
+
+origin_sbux <- list.files(path = '../',pattern='origin_sbux') %>%
+  paste0('../',.) %>%
+  map(readRDS) %>%
+  rbindlist()
+origin_sbux[, origin_cbg := bit64::as.integer64(origin_cbg)]
+
+# Turn both the origin files into POI-level adjustment measures
+data("cbg_pop")
+setnames(cbg_pop, 'poi_cbg','origin_cbg')
+
+sf <- readRDS('../summary_file_absolute_values.Rdata')
+sf[, start_date := as.Date(date_range_start)]
+setnames(sf, 'census_block_group','origin_cbg')
+flatten_origin <- function(dt, cbg_pop, sf, lvl) {
+  dt <- dt %>%
+    merge(cbg_pop, by = 'origin_cbg') %>%
+    merge(sf, by = c('start_date','origin_cbg'))
+  
+  dt[, visits_per_visitor := raw_visit_counts/raw_visitor_counts]
+  dt[, num_visitors_cbg_upper := max(visitor_home_cbgs), by = c(lvl,'origin_cbg','start_date')]
+  dt[, scaling_factor := unweighted_pop/number_devices_residing]
+  dt[, Extrpltd_Visitor_UPPER := scaling_factor*num_visitors_cbg_upper]
+  dt[, Extrplted_Visits_UPPER := Extrpltd_Visitor_UPPER*visits_per_visitor]
+  
+  dt <- dt[, .(true_visits_estimate_total = sum(Extrplted_Visits_UPPER)), by = c(lvl,'start_date')]
+  
+  return(dt)
+}
+
+origin_nfldata <- flatten_origin(origin_nfldata, cbg_pop, sf, 'location_name')
+origin_sbux <- flatten_origin(origin_sbux, cbg_pop, sf, 'safegraph_place_id')
 
 ```
 
@@ -229,7 +274,7 @@ sbux[, state_fips := floor(fips/1000)]
 
 print(sbux[1:10])
 
-sf <- readRDS('summary_file_absolute_values.Rdata')
+sf <- readRDS('../summary_file_absolute_values.Rdata')
 
 print(sf[1:10])
 
@@ -275,16 +320,14 @@ print(sbux[1:10])
 
 data("cbg_pop")
 setnames(cbg_pop,'unweighted_pop','pop')
-sf <- readRDS('summary_file_absolute_values.Rdata')
+sf <- readRDS('../summary_file_absolute_values.Rdata')
 
 setnames(sf, 'census_block_group','poi_cbg')
-sf[,poi_cbg := as.character(poi_cbg)]
 sf <- merge(sf, cbg_pop, by = 'poi_cbg')
 setnames(sf, c('number_devices_residing','pop'), c('ndr_cbg','pop_cbg'))
 sf[, date_range_start := as.Date(date_range_start)]
 setnames(sf, 'date_range_start', 'date')
 
-sbux[, poi_cbg := as.character(poi_cbg)]
 sbux <- copy(sf)[sbux, roll = TRUE, on = c('poi_cbg','date')]
 
 print(sbux[1:10])
@@ -293,6 +336,13 @@ sbux[, adjusted_cbg := visits_by_day*pop_cbg/ndr_cbg]
 sbux[, adjusted_county := visits_by_day*pop_county/ndr_county]
 sbux[, adjusted_state := visits_by_day*pop_state/ndr_state]
 sbux[, adjusted_nat := visits_by_day*pop_nat/ndr_nat]
+
+print(sbux[1:10])
+
+origin_sbux[, date := start_date]
+sbux <- copy(origin_sbux)[sbux, roll = TRUE, on = c('safegraph_place_id','date')]
+sbux[, weeks_visit := sum(visits_by_day), by = c('safegraph_place_id', 'start_date')]
+sbux[, true_visits_origin := (visits_by_day/weeks_visit)*true_visits_estimate_total]
 
 print(sbux[1:10])
 
@@ -378,7 +428,31 @@ ggplot(sbflat, aes(x = date, y = adjusted)) +
 
 ```
 
-In all of these, the CBG adjustment doesn't appear to work very well, even though a particular Starbucks is likely a local thing in many cases. The other three levels of aggregation all work just about the same. Interestingly, this implies a similar (although certainly not identical) portion of the population being sampled in different areas. But in any case, this adjustment is not quite as successful as you get with the normalization file. It doesn't adjust upwards as much, which is what we need.
+These all work fairly well, with the CBG adjustment doing the worst, despite Starbucks being local-customer businesses in many cases. The other three levels of aggregation all work just about the same. Interestingly, this implies a similar (although certainly not identical) portion of the population being sampled in different areas. But in any case, this adjustment is not quite as successful as you get with the normalization file. It doesn't adjust upwards as much, which is what we need.
+
+Let's do one more CBG-level adjustment. For this one, we look at the weekly `visitor_home_cbgs` variable, which records the number of visitors to each POI *from each CBG*. Then, we scale *those* visits up to the population level of those origin CBGs. This is a measure of number of *visitors* from each CBG, so we scale that again by the ratio of overall visitors to visits (`raw_visit_counts/raw_visitor_counts`) for that POI. Then for each POI we add up the adjuted origin-CBG numbers across all the origin CBGs to get our POI-week specific adjustment factor. Since this is a weekly measure, we take the proportion of visits in a given week that come on a given day and multiply that by the adjustment factor. More complex, but manages to smooth things out a bit better. So how does it do?
+
+```{r}
+sbflat <- sbux[, .(adjusted = mean(true_visits_origin, na.rm = TRUE)), by = 'date']
+ggplot(sbflat, aes(x = date, y = adjusted)) + 
+   geom_line(size = 1, color = 'blue') + 
+  geom_hline(aes(yintercept = mean(adjusted, na.rm = TRUE)), linetype = 'dashed', color = 'black')+
+  annotate(y = mean(sbflat$adjusted, na.rm = TRUE), 
+           x = max(sbux$date)+18, hjust = .5, vjust = .5,
+           geom = 'text', label = paste0('Grand Mean\n',
+                                         number(mean(sbflat$adjusted, na.rm = TRUE), accuracy = .1)),
+           size = 14/.pt, family = 'Georgia')+
+ theme_pubr() + 
+   expand_limits(x = max(sbflat$date)+28) +
+   theme(text = element_text(size = 16,
+                             family = 'Georgia')) +
+   labs(x = 'Date',
+        y = 'SafeGraph Raw Count (Mean)',
+        title = 'Origin CBG Adjustment')
+
+```
+Works okay! At least, it is an improvement on the CBG adjustment alone, getting a bit closer to the 500+ we want. But it is less of an adjustment than for the county, state, or national. In this case, at least, we might prefer going with those.
+
 
 ## National Football League
 
@@ -407,6 +481,13 @@ setnames(badsub, names(badsub), c('Stadium Name', 'Date','Official Count','SafeG
 
 kable(badsub,caption = 'Suspiciously Low SafeGraph Counts') %>%
   kable_styling('striped')
+
+# Get weekly counts
+just_start_dates <- origin_nfldata[, .(start_date)] %>%
+  unique()
+just_start_dates[, date := start_date]
+nfl <- copy(just_start_dates)[nfl, roll = TRUE, on = 'date']
+nfl[, weeks_visit := sum(visits_by_day), by = c('location_name','start_date')]
 
 nfl <- nfl[!(location_name %in% unique(badsub[['Stadium Name']]))]
 nfl <- nfl[!(is.na(count))]
@@ -537,7 +618,7 @@ nfl[, state_fips := floor(fips/1000)]
 
 print(nfl[1:10])
 
-sf <- readRDS('summary_file_absolute_values.Rdata')
+sf <- readRDS('../summary_file_absolute_values.Rdata')
 
 print(sf[1:10])
 
@@ -577,6 +658,12 @@ sf <- sf[, .(number_devices_residing = sum(number_devices_residing),
                  pop = sum(pop)), by = c('date')]
 nfl <- copy(sf)[nfl, roll = TRUE, on = 'date']
 setnames(nfl, c('number_devices_residing','pop'), c('ndr_nat', 'pop_nat'))
+
+print(nfl[1:10])
+
+origin_nfldata[, date := start_date]
+nfl <- copy(origin_nfldata)[nfl, roll = TRUE, on = c('location_name','date')]
+nfl[, true_visits_origin := (visits_by_day/weeks_visit)*true_visits_estimate_total]
 
 print(nfl[1:10])
 ```
@@ -644,6 +731,25 @@ ggplot(nfl, aes(x = mean(adjusted)+(adjusted - mean(adjusted))/(sqrt(17)),
 ```
 
 This works about the same. Arguably maybe better than `total_devices_seen`. Still an overstatement of amounts, and relies on that fairly arbitrary 17 and the ability to shrink across a group of events.
+
+Let's do one more CBG-level adjustment. For this one, we look at the weekly `visitor_home_cbgs` variable, which records the number of visitors to each POI *from each CBG*. Then, we scale *those* visits up to the population level of those origin CBGs. This is a measure of number of *visitors* from each CBG, so we scale that again by the ratio of overall visitors to visits (`raw_visit_counts/raw_visitor_counts`) for that POI. Then for each POI we add up the adjuted origin-CBG numbers across all the origin CBGs to get our POI-week specific adjustment factor. Since this is a weekly measure, we take the proportion of visits in a given week that come on a given day and multiply that by the adjustment factor. More complex, but manages to smooth things out a bit better. So how does it do?
+
+```{r}
+ggplot(nfl, aes(x = true_visits_estimate_total,
+                     y = count)) + 
+  geom_point() + 
+  geom_function(fun = function(x) x) + 
+  theme_pubr()  + 
+  theme(text = element_text(size = 16,
+                            family = 'Georgia')) +
+  scale_x_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  scale_y_continuous(labels = function(x) number(x, scale = 1/1000, accuracy = 1)) +
+  labs(x = 'Adjusted SafeGraph Count (Thousands)',
+       y = 'Raw Attendance Count (Thousands)',
+       title = 'Origin CBG Adjustment')
+```
+
+Doesn't seem that different from the other options.
 
 # Conclusion
 
